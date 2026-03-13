@@ -6,6 +6,7 @@ import asyncio
 import edge_tts
 import os
 import uuid
+import re
 from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, HTTPException
@@ -27,6 +28,23 @@ TTS_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "tts")
 os.makedirs(TTS_OUTPUT_DIR, exist_ok=True)
 
 
+def clean_text_for_tts(text: str) -> str:
+    """Clean text for TTS - remove special characters that can cause issues"""
+    # Remove SSML tags
+    text = re.sub(r'<[^>]+>', '', text)
+    
+    # Remove URLs
+    text = re.sub(r'https?://\S+', '', text)
+    
+    # Remove email addresses
+    text = re.sub(r'\S+@\S+', '', text)
+    
+    # Replace multiple newlines/spaces with single space
+    text = re.sub(r'\s+', ' ', text)
+    
+    return text.strip()
+
+
 class TTSRequest(BaseModel):
     text: str
     voice_type: Optional[str] = "female"  # female, male, british_female, british_male
@@ -34,6 +52,7 @@ class TTSRequest(BaseModel):
     webhook_url: Optional[str] = None
     project_code: Optional[str] = None  # For folder structure
     episode_code: Optional[str] = None  # For folder structure
+    filename: Optional[str] = None  # Custom filename for both audio and text
 
 
 class TTSResponse(BaseModel):
@@ -81,8 +100,19 @@ async def list_voices():
 @router.post("/generate", response_model=TTSResponse)
 async def generate_speech(request: TTSRequest):
     """Generate TTS audio"""
+    print(f"[TTS] Received request - text length: {len(request.text) if request.text else 0}, voice: {request.voice}")
+    
     if not request.text or len(request.text.strip()) == 0:
         raise HTTPException(status_code=400, detail="Text cannot be empty")
+    
+    # Clean text before generating audio - remove special characters that can cause Edge TTS to fail
+    cleaned_text = clean_text_for_tts(request.text)
+    
+    # Check if text is empty after cleaning
+    if not cleaned_text:
+        raise HTTPException(status_code=400, detail="Text is empty after removing special characters (URLs, SSML tags, etc.)")
+    
+    print(f"[TTS] Cleaned text length: {len(cleaned_text)} chars")
     
     # Determine voice
     if request.voice:
@@ -90,9 +120,14 @@ async def generate_speech(request: TTSRequest):
     else:
         voice = BEST_VOICES.get(request.voice_type, BEST_VOICES["female"])
     
-    # Generate unique filename
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"tts_{timestamp}_{uuid.uuid4().hex[:8]}.mp3"
+    # Generate filename - use custom name if provided
+    if request.filename:
+        audio_filename = f"{request.filename}.mp3"
+        txt_filename = f"{request.filename}.txt"
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        audio_filename = f"tts_{timestamp}_{uuid.uuid4().hex[:8]}.mp3"
+        txt_filename = None
     
     # Build output path: output/{project_code}/{episode_code}/audio/filename.mp3
     if request.project_code and request.episode_code:
@@ -103,20 +138,55 @@ async def generate_speech(request: TTSRequest):
         output_subdir = os.path.join(OUTPUT_DIR, "tts")
     
     os.makedirs(output_subdir, exist_ok=True)
-    filepath = os.path.join(output_subdir, filename)
+    audio_filepath = os.path.join(output_subdir, audio_filename)
     
     try:
-        # Create communicate object and save
-        communicate = edge_tts.Communicate(request.text, voice)
-        await communicate.save(filepath)
+        # Create communicate object and save - use cleaned_text instead of request.text
+        print(f"[TTS] Generating audio with voice: {voice}")
+        
+        # Try with requested voice first
+        communicate = edge_tts.Communicate(cleaned_text, voice)
+        
+        # Use asyncio.wait_for to add timeout
+        try:
+            await asyncio.wait_for(communicate.save(audio_filepath), timeout=60.0)
+        except asyncio.TimeoutError:
+            raise Exception("TTS generation timed out after 60 seconds - possible network issue or very long text")
+        except Exception as te:
+            # If the specific voice fails, try with a default voice
+            error_msg = str(te)
+            if "No audio was received" in error_msg or "voice" in error_msg.lower():
+                print(f"[TTS] Voice {voice} failed, trying default voice en-US-AvaNeural")
+                default_voice = "en-US-AvaNeural"
+                communicate = edge_tts.Communicate(cleaned_text, default_voice)
+                await asyncio.wait_for(communicate.save(audio_filepath), timeout=60.0)
+                voice = default_voice  # Update voice to the one that worked
+                print(f"[TTS] Successfully generated with fallback voice: {default_voice}")
+            else:
+                raise Exception(f"TTS communication error: {error_msg}")
+        
+        print(f"[TTS] Audio saved to: {audio_filepath}")
+        
+        # Check file size
+        file_size = os.path.getsize(audio_filepath) if os.path.exists(audio_filepath) else 0
+        print(f"[TTS] Audio file size: {file_size} bytes")
+        
+        # Save text file if filename is provided
+        txt_filepath = None
+        if txt_filename and request.project_code and request.episode_code:
+            txt_dir = os.path.join(OUTPUT_DIR, request.project_code, request.episode_code)
+            os.makedirs(txt_dir, exist_ok=True)
+            txt_filepath = os.path.join(txt_dir, txt_filename)
+            with open(txt_filepath, 'w', encoding='utf-8') as f:
+                f.write(request.text)
         
         # Build audio_url path: /{project_code}/{episode_code}/audio/filename.mp3
         if request.project_code and request.episode_code:
-            audio_url_path = f"/{request.project_code}/{request.episode_code}/audio/{filename}"
+            audio_url_path = f"/{request.project_code}/{request.episode_code}/audio/{audio_filename}"
         elif request.project_code:
-            audio_url_path = f"/{request.project_code}/audio/{filename}"
+            audio_url_path = f"/{request.project_code}/audio/{audio_filename}"
         else:
-            audio_url_path = f"/audio/{filename}"
+            audio_url_path = f"/audio/{audio_filename}"
         
         # Send webhook if provided
         if request.webhook_url:
@@ -129,14 +199,16 @@ async def generate_speech(request: TTSRequest):
         
         return TTSResponse(
             success=True,
-            audio_file=filename,
+            audio_file=audio_filename,
             audio_url=audio_url_path,
-            audio_path=filepath,  # Local file path for desktop app
+            audio_path=audio_filepath,
             voice=voice,
             text=request.text
         )
         
     except Exception as e:
+        print(f"[TTS] ERROR: {str(e)}")
+        
         # Send error webhook
         if request.webhook_url:
             await send_webhook(request.webhook_url, {
@@ -195,6 +267,69 @@ async def delete_audio(filename: str):
         return {"success": True, "message": f"Deleted {filename}"}
     
     raise HTTPException(status_code=404, detail="File not found")
+
+
+class SaveScriptRequest(BaseModel):
+    text: str
+    project_code: str
+    episode_code: str
+    script_name: str = "full_script"
+
+
+class SaveScriptResponse(BaseModel):
+    success: bool
+    file_path: str
+    file_url: str
+
+
+@router.post("/save_script", response_model=SaveScriptResponse)
+async def save_script(request: SaveScriptRequest):
+    """Save script text to file"""
+    if not request.text or len(request.text.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+    
+    # Build output path: output/{project_code}/{episode_code}/audio/{script_name}.txt
+    output_dir = os.path.join(OUTPUT_DIR, request.project_code, request.episode_code, "audio")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    txt_filename = f"{request.script_name}.txt"
+    filepath = os.path.join(output_dir, txt_filename)
+    
+    # Write text file
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(request.text)
+    
+    file_url = f"/{request.project_code}/{request.episode_code}/audio/{txt_filename}"
+    
+    return SaveScriptResponse(
+        success=True,
+        file_path=filepath,
+        file_url=file_url
+    )
+
+
+@router.get("/get_script")
+async def get_script(
+    project_code: str,
+    episode_code: str,
+    script_name: str = "full_script"
+):
+    """Get saved script content from file"""
+    output_dir = os.path.join(OUTPUT_DIR, project_code, episode_code, "audio")
+    txt_filename = f"{script_name}.txt"
+    filepath = os.path.join(output_dir, txt_filename)
+    
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail=f"Script '{script_name}' not found")
+    
+    with open(filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    return {
+        "success": True,
+        "content": content,
+        "file_path": filepath
+    }
 
 
 async def send_webhook(url: str, data: dict):

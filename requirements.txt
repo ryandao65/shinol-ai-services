@@ -10,6 +10,10 @@ pydantic>=2.0.0
 httpx>=0.24.0
 requests>=2.31.0
 
+# TTS - IMPORTANT: Use version 7.0.0 to avoid "No audio was received" errors
+# See: https://github.com/rany2/edge-tts/issues/440
+edge-tts==7.0.0
+
 # Audio Processing
 numpy>=1.24.0
 scipy>=1.11.0
