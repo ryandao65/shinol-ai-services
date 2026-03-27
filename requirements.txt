@@ -10,9 +10,10 @@ pydantic>=2.0.0
 httpx>=0.24.0
 requests>=2.31.0
 
-# TTS - IMPORTANT: Use version 7.0.0 to avoid "No audio was received" errors
-# See: https://github.com/rany2/edge-tts/issues/440
-edge-tts==7.0.0
+# TTS — edge-tts 7.2.7+ fixes 403 / WSS handshake on speech.platform.bing.com (Sec-MS-GEC, etc.)
+# See: https://github.com/rany2/edge-tts/issues/458 — older 7.0.x often fails preview + /tts/generate
+# If "No audio was received" regresses: https://github.com/rany2/edge-tts/issues/440
+edge-tts>=7.2.7,<8
 
 # Audio Processing
 numpy>=1.24.0
@@ -26,6 +27,17 @@ transformers>=4.30.0
 accelerate>=0.20.0
 faster-whisper>=0.10.0
 kokoro>=0.9.0
+# Japanese Kokoro voices (jf_* / jm_*): pulls Misaki ja + pyopenjtalk + unidic (fixes No module named 'pyopenjtalk')
+# Same venv as: python -m uvicorn …   →   pip install "misaki[ja]"
+# If UniDic data missing: python -m unidic download
+misaki[ja]>=0.9.0,<0.10.0
+
+# MeloTTS — Japanese local TTS. PyPI `melotts` often fails on Windows; use GitHub:
+#   pip install git+https://github.com/myshell-ai/MeloTTS.git
+# Required once per Python env (same venv as uvicorn): downloads ~500MB UniDic / fixes missing mecabrc
+#   python -m unidic download
+git+https://github.com/myshell-ai/MeloTTS.git
+unidic>=1.1.0
 
 # Image Processing
 pillow>=10.0.0

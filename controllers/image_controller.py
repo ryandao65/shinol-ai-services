@@ -14,14 +14,16 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import httpx
 
+from paths import get_output_root, package_root
+
 router = APIRouter(prefix="/image", tags=["Image Generation"])
 
 # Output directory
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "output", "images")
+OUTPUT_DIR = os.path.join(get_output_root(), "images")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Model cache directory
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
+MODEL_DIR = os.path.join(package_root(), "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 

@@ -11,14 +11,16 @@ from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 import httpx
 
+from paths import get_output_root, package_root
+
 router = APIRouter(prefix="/audio", tags=["Audio Transcription"])
 
 # Output directory
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "output", "transcriptions")
+OUTPUT_DIR = os.path.join(get_output_root(), "transcriptions")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Model cache directory
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models", "whisper")
+MODEL_DIR = os.path.join(package_root(), "models", "whisper")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 

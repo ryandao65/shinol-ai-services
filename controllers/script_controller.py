@@ -11,10 +11,12 @@ from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from paths import get_output_root
+
 router = APIRouter(prefix="/script", tags=["Script"])
 
 # Output directory for scripts
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "output")
+OUTPUT_DIR = get_output_root()
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 

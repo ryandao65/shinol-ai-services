@@ -1,5 +1,6 @@
 """
-LLM Controller - Local LLM using Ollama
+LLM Controller - Local LLM using Ollama.
+Synchronous chat-turn endpoints for workflow template 2 (Gemini / Ollama) live here so the desktop app only calls this API.
 """
 import os
 import uuid
@@ -9,10 +10,27 @@ import time
 from enum import Enum
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import httpx
 
 router = APIRouter(prefix="/llm", tags=["LLM"])
+
+# Long-running story chapters (workflow template 2 multi-turn)
+_CHAT_TURN_HTTP_TIMEOUT = 600.0
+
+# Ollama defaults live here (desktop does not embed localhost:11434 or num_predict rules)
+_DEFAULT_OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+_OLLAMA_CHAT_TURN_NUM_PREDICT_FLOOR = 8192
+
+
+def _resolve_ollama_chat_turn_base_url(override: Optional[str]) -> str:
+    if override and str(override).strip():
+        return str(override).rstrip("/")
+    return _DEFAULT_OLLAMA_BASE_URL
+
+
+def _ollama_chat_turn_num_predict(max_tokens: int) -> int:
+    return max(int(max_tokens), _OLLAMA_CHAT_TURN_NUM_PREDICT_FLOOR)
 
 # Job management
 jobs: Dict[str, Dict[str, Any]] = {}
@@ -96,6 +114,148 @@ def call_ollama(prompt: str, model: str, temperature: float, max_tokens: int, sy
     return result.get("response", "")
 
 
+# ============ CHAT TURN (workflow template 2: desktop → Google Gemini / Ollama) ============
+
+
+class ChatTurnGeminiRequest(BaseModel):
+    """One multi-turn step for スカッと朗読 body generation (Gemini generateContent v1beta)."""
+
+    api_key: str
+    model: str
+    system_instruction: str
+    contents: List[Dict[str, Any]] = Field(default_factory=list)
+    user_text: str
+    temperature: float = 0.7
+    top_p: float = 0.95
+    max_output_tokens: int = 8192
+
+
+class ChatTurnGeminiResponse(BaseModel):
+    text: str
+    contents: List[Dict[str, Any]]
+
+
+class ChatTurnOllamaRequest(BaseModel):
+    """One multi-turn step for Japanese workflow body (Ollama /api/chat).
+
+    Defaults for Ollama host and output length are applied server-side; desktop sends DB fields only.
+    """
+
+    model: str
+    system_instruction: str
+    messages: List[Dict[str, Any]] = Field(default_factory=list)
+    user_text: str
+    temperature: float = 0.7
+    top_p: float = 0.95
+    max_tokens: int = 4096
+    ollama_base_url: Optional[str] = None
+
+
+class ChatTurnOllamaResponse(BaseModel):
+    text: str
+    messages: List[Dict[str, Any]]
+
+
+@router.post("/chat/turn/gemini", response_model=ChatTurnGeminiResponse)
+async def chat_turn_gemini(req: ChatTurnGeminiRequest):
+    """
+    Append user turn, call Google Gemini v1beta, append model turn.
+    Keeps provider keys and HTTP details out of the Rust/Tauri app.
+    """
+    contents: List[Dict[str, Any]] = [dict(x) for x in req.contents]
+    contents.append({"role": "user", "parts": [{"text": req.user_text}]})
+    body = {
+        "systemInstruction": {"parts": [{"text": req.system_instruction}]},
+        "contents": contents,
+        "generationConfig": {
+            "temperature": req.temperature,
+            "maxOutputTokens": req.max_output_tokens,
+            "topP": req.top_p,
+        },
+    }
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{req.model}:generateContent?key={req.api_key}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=_CHAT_TURN_HTTP_TIMEOUT) as client:
+            r = await client.post(url, json=body, headers={"Content-Type": "application/json"})
+    except httpx.ConnectError as e:
+        raise HTTPException(status_code=502, detail=f"Gemini request failed (network): {e}") from e
+    text_body = r.text
+    if r.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Google Gemini API error {r.status_code}: {text_body[:2000]}",
+        )
+    try:
+        result = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Invalid JSON from Gemini: {e}") from e
+
+    try:
+        text = (
+            result["candidates"][0]["content"]["parts"][0]["text"]
+        )
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini returned no text in candidates (check API key, model, or safety blocking).",
+        )
+
+    contents.append({"role": "model", "parts": [{"text": text}]})
+    return ChatTurnGeminiResponse(text=text, contents=contents)
+
+
+@router.post("/chat/turn/ollama", response_model=ChatTurnOllamaResponse)
+async def chat_turn_ollama(req: ChatTurnOllamaRequest):
+    """Append user message, call Ollama /api/chat, append assistant message."""
+    messages: List[Dict[str, Any]] = [dict(x) for x in req.messages]
+    if not messages:
+        messages.append({"role": "system", "content": req.system_instruction})
+    messages.append({"role": "user", "content": req.user_text})
+
+    base = _resolve_ollama_chat_turn_base_url(req.ollama_base_url)
+    chat_url = f"{base}/api/chat"
+    num_predict = _ollama_chat_turn_num_predict(req.max_tokens)
+    payload = {
+        "model": req.model,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "num_predict": num_predict,
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_CHAT_TURN_HTTP_TIMEOUT) as client:
+            r = await client.post(chat_url, json=payload)
+    except httpx.ConnectError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Cannot connect to Ollama at {base}. Is Ollama running? ({e})",
+        ) from e
+
+    if r.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ollama chat error {r.status_code}: {r.text[:2000]}",
+        )
+    try:
+        data = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Invalid JSON from Ollama: {e}") from e
+
+    try:
+        text = data["message"]["content"]
+    except (KeyError, TypeError):
+        raise HTTPException(status_code=502, detail="Ollama response missing message.content")
+
+    messages.append({"role": "assistant", "content": text})
+    return ChatTurnOllamaResponse(text=text, messages=messages)
+
+
 def call_ollama_chat(messages: List[dict], model: str, temperature: float, max_tokens: int) -> str:
     """Call Ollama API for chat"""
     import requests
@@ -126,6 +286,8 @@ async def root():
         "usage": {
             "generate": "POST /llm/generate with {\"prompt\": \"your prompt\"}",
             "chat": "POST /llm/chat with {\"messages\": [{\"role\": \"user\", \"content\": \"hello\"}]}",
+            "chat_turn_gemini": "POST /llm/chat/turn/gemini (workflow template 2 → Google Gemini multi-turn)",
+            "chat_turn_ollama": "POST /llm/chat/turn/ollama (workflow template 2 → Ollama /api/chat multi-turn)",
             "models": "GET /llm/models",
             "status": "GET /llm/status/{job_id}",
         }

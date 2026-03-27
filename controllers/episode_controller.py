@@ -7,13 +7,14 @@ import asyncio
 import httpx
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+from paths import get_output_root
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/episode", tags=["Episode Enhancement"])
 
 # Output directory
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "output")
+OUTPUT_DIR = get_output_root()
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # LLM endpoint

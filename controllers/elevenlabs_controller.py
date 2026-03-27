@@ -10,13 +10,15 @@ from typing import Optional, List
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from paths import get_output_root
+
 router = APIRouter(prefix="/tts/elevenlabs", tags=["ElevenLabs TTS"])
 
 # API Key from environment
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 
 # Output directory
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "output", "tts_elevenlabs")
+OUTPUT_DIR = os.path.join(get_output_root(), "tts_elevenlabs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 

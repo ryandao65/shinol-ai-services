@@ -13,10 +13,12 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import numpy as np
 
+from paths import get_output_root
+
 router = APIRouter(prefix="/tts/kokoro", tags=["Kokoro TTS"])
 
 # Output directory - use same structure as tts_controller
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "output")
+OUTPUT_DIR = get_output_root()
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
@@ -30,11 +32,13 @@ class JobStatus(str, Enum):
 
 class KokoroTTSRequest(BaseModel):
     text: str
-    voice: str = "af_sarah"  # Default voice
+    voice: str = "jf_alpha"  # Default: Japanese (Kokoro JP voices use jf_* / jm_*)
     speed: float = 1.0
     project_code: Optional[str] = None
     episode_code: Optional[str] = None
     webhook_url: Optional[str] = None
+    output_dir: Optional[str] = None  # Absolute episode dir from desktop app (preferred when provided)
+    filename: Optional[str] = None  # Optional custom basename from desktop app (e.g. body_part_1)
 
 
 class KokoroTTSResponse(BaseModel):
@@ -54,9 +58,15 @@ class JobStatusResponse(BaseModel):
     completed_at: Optional[float] = None
 
 
-# Available voices - Kokoro voice IDs
+# Available voices — lang matches KPipeline(lang_code=...): j=Japanese, a=American, b=British
 KOKORO_VOICES = {
-    # American Female
+    # Japanese (use for 日本語 content; requires misaki[ja] / JP pipeline deps)
+    "jf_alpha": {"lang": "j", "name": "Japanese Female - alpha"},
+    "jf_gongitsune": {"lang": "j", "name": "Japanese Female - gongitsune"},
+    "jf_nezumi": {"lang": "j", "name": "Japanese Female - nezumi"},
+    "jf_tebukuro": {"lang": "j", "name": "Japanese Female - tebukuro"},
+    "jm_kumo": {"lang": "j", "name": "Japanese Male - kumo"},
+    # American English (legacy)
     "af_sarah": {"lang": "a", "name": "American Female - Sarah"},
     "af_nicole": {"lang": "a", "name": "American Female - Nicole"},
     "af_serena": {"lang": "a", "name": "American Female - Serena"},
@@ -94,14 +104,27 @@ def clean_text_for_tts(text: str) -> str:
     # Remove email addresses
     text = re.sub(r'\S+@\S+', '', text)
     
-    # Replace multiple newlines/spaces with single space
-    text = re.sub(r'\s+', ' ', text)
-    
-    # Remove remaining special characters except basic punctuation
-    # Keep: letters, numbers, basic punctuation (.,!?,-)
-    text = re.sub(r'[^\w\s.,!?\-\']+', '', text)
-    
+    # Keep line boundaries for long-form chunking; collapse spaces/tabs per line only.
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in text.splitlines()]
+    text = "\n".join([ln for ln in lines if ln])
+
+    # Remove control chars (except newline) without stripping Japanese punctuation.
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", text)
+
     return text.strip()
+
+
+def get_kokoro_split_pattern() -> str:
+    """Regex used by Kokoro pipeline to split long Japanese text into stable chunks."""
+    return r"[。！？!?]+|\n+"
+
+
+def sanitize_filename_stem(name: str) -> str:
+    """Keep predictable, filesystem-safe basename for saved audio."""
+    stem = re.sub(r'\.[A-Za-z0-9]+$', '', (name or '').strip())
+    stem = re.sub(r'[^A-Za-z0-9._-]+', '_', stem)
+    stem = stem.strip('._-')
+    return stem[:120] if stem else ""
 
 
 class KokoroWorker:
@@ -190,7 +213,7 @@ class KokoroWorker:
             job["status"] = JobStatus.GENERATING
             
             # Get voice info
-            voice_info = KOKORO_VOICES.get(request.voice, KOKORO_VOICES["af_sarah"])
+            voice_info = KOKORO_VOICES.get(request.voice, KOKORO_VOICES["jf_alpha"])
             voice = request.voice
             lang = voice_info["lang"]
             
@@ -207,19 +230,25 @@ class KokoroWorker:
             
             job["progress"] = 80
             
-            # Build output path
-            if request.project_code and request.episode_code:
+            # Build output path (must match audio_url: /audio/... → OUTPUT_DIR/audio/...)
+            if request.output_dir and request.output_dir.strip():
+                output_subdir = os.path.join(request.output_dir.strip(), "audio")
+            elif request.project_code and request.episode_code:
                 output_subdir = os.path.join(OUTPUT_DIR, request.project_code, request.episode_code, "audio")
             elif request.project_code:
                 output_subdir = os.path.join(OUTPUT_DIR, request.project_code, "audio")
             else:
-                output_subdir = OUTPUT_DIR
+                output_subdir = os.path.join(OUTPUT_DIR, "audio")
             
             os.makedirs(output_subdir, exist_ok=True)
             
-            # Save audio as WAV (MP3 requires pydub)
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = f"kokoro_{timestamp}_{uuid.uuid4().hex[:8]}.wav"
+            # Save audio with optional deterministic filename from desktop app.
+            custom_stem = sanitize_filename_stem(request.filename or "")
+            if custom_stem:
+                filename = f"{custom_stem}.wav"
+            else:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = f"kokoro_{timestamp}_{uuid.uuid4().hex[:8]}.wav"
             filepath = os.path.join(output_subdir, filename)
             
             # Convert to MP3 using pydub
@@ -279,46 +308,79 @@ class KokoroWorker:
             text,
             voice=voice,
             speed=speed,
-            split_pattern=r"\n+"
+            # Split on Japanese sentence boundaries and newlines for stable long synthesis.
+            split_pattern=get_kokoro_split_pattern(),
         )
-        
-        chunks = [audio for *_ignored, audio in generator]
+
+        chunk_count = 0
+        chunk_text_lens: list[int] = []
+        chunk_item_types: list[str] = []
+        chunks = []
+        for item in generator:
+            chunk_count += 1
+            chunk_item_types.append(type(item).__name__)
+            try:
+                # Kokoro yields iterable Result-like entries, commonly (graphemes, phonemes, audio).
+                *prefix, audio = item
+                graphemes = prefix[0] if len(prefix) > 0 else ""
+                if isinstance(graphemes, str):
+                    chunk_text_lens.append(len(graphemes))
+                chunks.append(np.asarray(audio))
+            except Exception as e:
+                raise RuntimeError(f"Invalid Kokoro generator item: {e}") from e
+
         if not chunks:
             raise RuntimeError("Kokoro returned no audio chunks")
-        
-        audio = np.concatenate(chunks)
+
+        try:
+            audio = np.concatenate(chunks)
+        except Exception as e:
+            raise
         sample_rate = 24000  # Kokoro default
         return audio, sample_rate
     
     def _save_as_mp3(self, audio: np.ndarray, sample_rate: int, filepath: str):
-        """Save audio as MP3"""
-        # Try using soundfile first (simpler), fall back to manual MP3 encoding
+        """Write WAV or MP3. Final path ending in .wav is written as PCM WAV (no temp delete bug)."""
+        import tempfile
+
+        lower = filepath.lower()
+        if lower.endswith(".wav"):
+            try:
+                import soundfile as sf
+
+                sf.write(filepath, audio, sample_rate)
+            except ImportError:
+                import scipy.io.wavfile as wavfile
+
+                wavfile.write(filepath, sample_rate, (audio * 32767).astype(np.int16))
+            return
+
+        # MP3: must use a temp WAV path distinct from filepath (never filepath.replace for .wav targets)
+        fd, tmp_wav = tempfile.mkstemp(suffix=".wav", prefix="kokoro_")
+        os.close(fd)
         try:
-            import soundfile as sf
-            
-            # Save as WAV first (soundfile doesn't support MP3 directly)
-            wav_path = filepath.replace('.mp3', '.wav')
-            sf.write(wav_path, audio, sample_rate)
-            
-            # Convert to MP3 using pydub if available
+            try:
+                import soundfile as sf
+
+                sf.write(tmp_wav, audio, sample_rate)
+            except ImportError:
+                import scipy.io.wavfile as wavfile
+
+                wavfile.write(tmp_wav, sample_rate, (audio * 32767).astype(np.int16))
             try:
                 from pydub import AudioSegment
-                audio_segment = AudioSegment.from_wav(wav_path)
-                audio_segment.export(filepath, format="mp3", bitrate="128k")
-                # Remove temp WAV
-                os.remove(wav_path)
-            except ImportError:
-                # pydub not available, return WAV path instead
-                if filepath.endswith('.mp3'):
-                    filepath = wav_path
-        except ImportError:
-            # soundfile not available, use scipy
-            import scipy.io.wavfile as wavfile
-            wav_path = filepath.replace('.mp3', '.wav')
-            wavfile.write(wav_path, sample_rate, (audio * 32767).astype(np.int16))
-            if not filepath.endswith('.wav'):
-                # Rename to wav if needed
-                os.rename(wav_path, filepath)
+
+                seg = AudioSegment.from_wav(tmp_wav)
+                seg.export(filepath, format="mp3", bitrate="128k")
+            except ImportError as e:
+                raise RuntimeError(
+                    "MP3 output requires pydub; install pydub or use a .wav filename."
+                ) from e
+        finally:
+            try:
+                os.remove(tmp_wav)
+            except OSError:
+                pass
     
     async def _send_webhook(self, url: str, data: dict):
         try:
@@ -333,6 +395,27 @@ class KokoroWorker:
 worker = KokoroWorker()
 
 
+async def synthesize_kokoro_wav_bytes(text: str, voice: str, speed: float) -> bytes:
+    """WAV bytes for preview / cache (no job queue)."""
+    await worker.initialize()
+    clean_text = clean_text_for_tts(text)
+    if not clean_text:
+        raise ValueError("Text is empty after cleaning")
+    voice_key = voice if voice in KOKORO_VOICES else "jf_alpha"
+    voice_info = KOKORO_VOICES[voice_key]
+    lang = voice_info["lang"]
+    audio, sample_rate = await asyncio.to_thread(
+        worker._synthesize_sync, clean_text, voice_key, speed, lang
+    )
+    import io
+
+    import soundfile as sf
+
+    buf = io.BytesIO()
+    sf.write(buf, audio, sample_rate, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
 # ============ ROUTES ============
 
 @router.get("/")
@@ -340,10 +423,10 @@ async def root():
     return {
         "message": "Kokoro TTS Service - Local High-Quality Voice",
         "voices": {k: v["name"] for k, v in KOKORO_VOICES.items()},
-        "default_voice": "af_sarah",
+        "default_voice": "jf_alpha",
         "usage": {
-            "generate": "POST /tts/kokoro/generate with {\"text\": \"Hello!\", \"voice\": \"af_sarah\"}",
-            "generate_sync": "POST /tts/kokoro/generate_sync with {\"text\": \"Hello!\"}",
+            "generate": "POST /tts/kokoro/generate with {\"text\": \"…\", \"voice\": \"jf_alpha\"}",
+            "generate_sync": "POST /tts/kokoro/generate_sync with {\"text\": \"…\"}",
             "status": "GET /tts/kokoro/status/{job_id}",
         }
     }
@@ -358,6 +441,16 @@ async def list_voices():
             for k, v in KOKORO_VOICES.items()
         ]
     }
+
+
+@router.get("/ping")
+async def ping_kokoro():
+    """Lightweight check: load Kokoro pipeline (may take time on first run)."""
+    try:
+        await worker.initialize()
+        return {"ok": True, "message": "Kokoro pipeline ready"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
 
 @router.post("/generate", response_model=KokoroTTSResponse)
@@ -385,8 +478,20 @@ async def generate_speech_sync(request: KokoroTTSRequest):
     job_id = f"kokoro_{uuid.uuid4().hex[:12]}"
     await worker.add_job(job_id, request)
     
-    # Poll for completion
-    max_wait = 300  # 5 minutes max
+    # Poll for completion (align with desktop SHINOL_LONG_TTS_MAX_WAIT_SEC; default 4h)
+    def _sync_max_wait_sec() -> float:
+        for key in ("KOKORO_SYNC_MAX_WAIT_SEC", "SHINOL_LONG_TTS_MAX_WAIT_SEC"):
+            raw = os.environ.get(key)
+            if raw is not None and str(raw).strip():
+                try:
+                    v = float(raw)
+                    if v > 0:
+                        return v
+                except ValueError:
+                    pass
+        return 14400.0
+
+    max_wait = _sync_max_wait_sec()
     start_time = time.time()
     
     while time.time() - start_time < max_wait:

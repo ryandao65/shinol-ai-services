@@ -12,6 +12,8 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from paths import get_output_root
+
 router = APIRouter(prefix="/tts", tags=["TTS"])
 
 # Best English voices
@@ -23,9 +25,24 @@ BEST_VOICES = {
 }
 
 # Output directory
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "output")
+OUTPUT_DIR = get_output_root()
 TTS_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "tts")
 os.makedirs(TTS_OUTPUT_DIR, exist_ok=True)
+
+
+def _resolve_episode_root(output_dir: Optional[str], project_code: Optional[str], episode_code: Optional[str]) -> str:
+    """
+    Resolve on-disk episode root.
+    - If `output_dir` is provided by desktop app, use it directly.
+    - Else fallback to OUTPUT_DIR/{project_code}/{episode_code} (or OUTPUT_DIR for generic requests).
+    """
+    if output_dir and output_dir.strip():
+        return output_dir.strip()
+    if project_code and episode_code:
+        return os.path.join(OUTPUT_DIR, project_code, episode_code)
+    if project_code:
+        return os.path.join(OUTPUT_DIR, project_code)
+    return OUTPUT_DIR
 
 
 def clean_text_for_tts(text: str) -> str:
@@ -53,6 +70,7 @@ class TTSRequest(BaseModel):
     project_code: Optional[str] = None  # For folder structure
     episode_code: Optional[str] = None  # For folder structure
     filename: Optional[str] = None  # Custom filename for both audio and text
+    output_dir: Optional[str] = None  # Absolute episode dir from desktop app (preferred when provided)
 
 
 class TTSResponse(BaseModel):
@@ -129,11 +147,12 @@ async def generate_speech(request: TTSRequest):
         audio_filename = f"tts_{timestamp}_{uuid.uuid4().hex[:8]}.mp3"
         txt_filename = None
     
-    # Build output path: output/{project_code}/{episode_code}/audio/filename.mp3
-    if request.project_code and request.episode_code:
-        output_subdir = os.path.join(OUTPUT_DIR, request.project_code, request.episode_code, "audio")
-    elif request.project_code:
-        output_subdir = os.path.join(OUTPUT_DIR, request.project_code, "audio")
+    # Build output path
+    if request.project_code or request.episode_code or (request.output_dir and request.output_dir.strip()):
+        episode_root = _resolve_episode_root(
+            request.output_dir, request.project_code, request.episode_code
+        )
+        output_subdir = os.path.join(episode_root, "audio")
     else:
         output_subdir = os.path.join(OUTPUT_DIR, "tts")
     
@@ -147,11 +166,11 @@ async def generate_speech(request: TTSRequest):
         # Try with requested voice first
         communicate = edge_tts.Communicate(cleaned_text, voice)
         
-        # Use asyncio.wait_for to add timeout
+        # Use asyncio.wait_for to add timeout - 180s for long text (up to ~15 min audio)
         try:
-            await asyncio.wait_for(communicate.save(audio_filepath), timeout=60.0)
+            await asyncio.wait_for(communicate.save(audio_filepath), timeout=180.0)
         except asyncio.TimeoutError:
-            raise Exception("TTS generation timed out after 60 seconds - possible network issue or very long text")
+            raise Exception("TTS generation timed out after 180 seconds - text too long")
         except Exception as te:
             # If the specific voice fails, try with a default voice
             error_msg = str(te)
@@ -159,7 +178,7 @@ async def generate_speech(request: TTSRequest):
                 print(f"[TTS] Voice {voice} failed, trying default voice en-US-AvaNeural")
                 default_voice = "en-US-AvaNeural"
                 communicate = edge_tts.Communicate(cleaned_text, default_voice)
-                await asyncio.wait_for(communicate.save(audio_filepath), timeout=60.0)
+                await asyncio.wait_for(communicate.save(audio_filepath), timeout=180.0)
                 voice = default_voice  # Update voice to the one that worked
                 print(f"[TTS] Successfully generated with fallback voice: {default_voice}")
             else:
@@ -173,8 +192,11 @@ async def generate_speech(request: TTSRequest):
         
         # Save text file if filename is provided
         txt_filepath = None
-        if txt_filename and request.project_code and request.episode_code:
-            txt_dir = os.path.join(OUTPUT_DIR, request.project_code, request.episode_code)
+        if txt_filename and (request.project_code or request.episode_code or (request.output_dir and request.output_dir.strip())):
+            episode_root = _resolve_episode_root(
+                request.output_dir, request.project_code, request.episode_code
+            )
+            txt_dir = os.path.join(episode_root, "scripts")
             os.makedirs(txt_dir, exist_ok=True)
             txt_filepath = os.path.join(txt_dir, txt_filename)
             with open(txt_filepath, 'w', encoding='utf-8') as f:
@@ -274,6 +296,7 @@ class SaveScriptRequest(BaseModel):
     project_code: str
     episode_code: str
     script_name: str = "full_script"
+    output_dir: Optional[str] = None  # Absolute episode dir from desktop app (preferred when provided)
 
 
 class SaveScriptResponse(BaseModel):
@@ -288,8 +311,11 @@ async def save_script(request: SaveScriptRequest):
     if not request.text or len(request.text.strip()) == 0:
         raise HTTPException(status_code=400, detail="Text cannot be empty")
     
-    # Build output path: output/{project_code}/{episode_code}/audio/{script_name}.txt
-    output_dir = os.path.join(OUTPUT_DIR, request.project_code, request.episode_code, "audio")
+    # Build output path
+    episode_root = _resolve_episode_root(
+        request.output_dir, request.project_code, request.episode_code
+    )
+    output_dir = os.path.join(episode_root, "scripts")
     os.makedirs(output_dir, exist_ok=True)
     
     txt_filename = f"{request.script_name}.txt"
@@ -299,7 +325,7 @@ async def save_script(request: SaveScriptRequest):
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(request.text)
     
-    file_url = f"/{request.project_code}/{request.episode_code}/audio/{txt_filename}"
+    file_url = f"/{request.project_code}/{request.episode_code}/scripts/{txt_filename}"
     
     return SaveScriptResponse(
         success=True,
@@ -315,7 +341,7 @@ async def get_script(
     script_name: str = "full_script"
 ):
     """Get saved script content from file"""
-    output_dir = os.path.join(OUTPUT_DIR, project_code, episode_code, "audio")
+    output_dir = os.path.join(OUTPUT_DIR, project_code, episode_code, "scripts")
     txt_filename = f"{script_name}.txt"
     filepath = os.path.join(output_dir, txt_filename)
     
